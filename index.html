@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HUSH: The Frequency Trap</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+body{display:flex;align-items:center;justify-content:center}
+canvas{max-width:100vw;max-height:100vh;box-shadow:0 0 50px rgba(0,255,120,.08)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ---------- CONFIG ----------
+const T = 28, CW = 15, CH = 11, GW = CW * 2 + 1, GH = CH * 2 + 1;
+const MW = GW * T, MH = GH * T, BAR = 74;
+const FONT = '"Courier New", Courier, monospace';
+const D = [[1,0],[-1,0],[0,1],[0,-1]];
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+cv.width = MW; cv.height = MH + BAR;
+const fogC = document.createElement('canvas'); fogC.width = MW; fogC.height = MH;
+const fx = fogC.getContext('2d');
+const mazeC = document.createElement('canvas'); mazeC.width = MW; mazeC.height = MH;
+
+// ---------- STATE ----------
+let state = 'boot'; // boot, calib, play, win, lose
+let grid, player, monster, cores, exitPos, got = 0, time = 0, hint = 8;
+let actx, analyser, buf, micOK = false;
+let level = 0, stepN = 0, eff = 0, nstate = 0;
+let base = 0.005, warn = 0.02, breach = 0.04;
+let calibT = 0, calibSum = 0, calibN = 0;
+const keys = {};
+let lasers = [], glassAt = {}, bolts = [], ripples = [];
+let showMap = false, seen = []; // blueprint overlay + discovered-tile grid
+let lvl = 1, cfg, cards = 0, term = null, code = [], known = [], solved = true, keypad = null;
+let elev = { on: false, t: 0 }, frenzy = false, lamps = [];
+let lockers = [], hide = null, loseMsg = 'It followed the sound.', toastT = 0, toastS = '', catchImm = 0;
+let clk = 0, flashT = 0, alarmT = 0, sfxGate = 0, alertCD = 0, laserCD = 0, boltCD = 0, glassTimer = 0, glassN = 0, prevN = 0;
+
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (actx && actx.state !== 'running') actx.resume();
+  if ((e.code === 'Enter' || e.code === 'KeyR') && (state === 'win' || state === 'lose')) startGame();
+  if (e.code === 'Space') { e.preventDefault(); if (!e.repeat && state === 'play') throwBolt(); }
+  else if (e.code.startsWith('Arrow')) e.preventDefault();
+  if (e.code === 'KeyM' && !e.repeat && state === 'play') showMap = !showMap; // map never pauses the game
+  if (state === 'play' && keypad) keypadKey(e);
+  else if (e.code === 'KeyE' && !e.repeat && state === 'play') interact();
+});
+addEventListener('keyup', e => keys[e.code] = false);
+addEventListener('pointerdown', () => { if (actx && actx.state !== 'running') actx.resume(); });
+
+// ---------- AUDIO ----------
+async function initAudio() {
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = actx.createMediaStreamSource(s);
+    analyser = actx.createAnalyser();
+    analyser.fftSize = 1024;
+    src.connect(analyser);
+    buf = new Float32Array(analyser.fftSize);
+    micOK = true;
+    actx.resume();
+  } catch (e) { micOK = false; try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {} }
+  state = 'calib';
+}
+
+function readMic() {
+  let raw = 0;
+  if (micOK) {
+    analyser.getFloatTimeDomainData(buf);
+    let s = 0;
+    for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+    raw = Math.sqrt(s / buf.length);
+  } else if (keys.KeyN) raw = breach * 1.4;
+  if (sfxGate > 0) raw = 0; // ignore the game's own speaker sounds
+  level = raw > level ? raw : level * 0.92 + raw * 0.08; // fast attack, slow decay
+  return raw;
+}
+
+// ---------- MAZE ----------
+function genMaze() {
+  grid = Array.from({ length: GH }, () => Array(GW).fill(1));
+  const st = [[0, 0]], seen = new Set(['0,0']);
+  grid[1][1] = 0;
+  while (st.length) {
+    const [cx, cy] = st[st.length - 1];
+    const nb = D.map(([dx, dy]) => [cx + dx, cy + dy, dx, dy])
+      .filter(([x, y]) => x >= 0 && y >= 0 && x < CW && y < CH && !seen.has(x + ',' + y));
+    if (!nb.length) { st.pop(); continue; }
+    const [nx, ny, dx, dy] = nb[Math.random() * nb.length | 0];
+    seen.add(nx + ',' + ny);
+    grid[ny * 2 + 1][nx * 2 + 1] = 0;
+    grid[cy * 2 + 1 + dy][cx * 2 + 1 + dx] = 0;
+    st.push([nx, ny]);
+  }
+  for (let i = 0; i < 30; i++) { // knock walls out so there are loops
+    const x = 1 + Math.random() * (GW - 2) | 0, y = 1 + Math.random() * (GH - 2) | 0;
+    if ((x + y) % 2 === 1) grid[y][x] = 0;
+  }
+  const m = mazeC.getContext('2d');
+  for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) {
+    if (grid[y][x]) {
+      m.fillStyle = '#1b2733'; m.fillRect(x * T, y * T, T, T);
+      m.fillStyle = '#26384a'; m.fillRect(x * T, y * T, T, 3);
+      m.fillStyle = '#10181f'; m.fillRect(x * T, y * T + T - 3, T, 3);
+    } else {
+      m.fillStyle = (x + y) % 2 ? '#0c1218' : '#0a0f14'; m.fillRect(x * T, y * T, T, T);
+    }
+  }
+}
+
+function bfs(sx, sy, tx, ty) {
+  const start = sy * GW + sx, prev = new Int16Array(GW * GH).fill(-2);
+  const q = [start]; prev[start] = -1;
+  for (let i = 0; i < q.length; i++) {
+    const c = q[i], x = c % GW, y = c / GW | 0;
+    if (x === tx && y === ty) break;
+    for (const [dx, dy] of D) {
+      const nx = x + dx, ny = y + dy;
+      if (grid[ny][nx] || prev[ny * GW + nx] !== -2) continue;
+      prev[ny * GW + nx] = c; q.push(ny * GW + nx);
+    }
+  }
+  let c = ty * GW + tx;
+  if (prev[c] === -2) return null;
+  while (prev[c] !== -1 && prev[c] !== start) c = prev[c];
+  return [c % GW, c / GW | 0];
+}
+
+const rndCell = () => [(Math.random() * CW | 0) * 2 + 1, (Math.random() * CH | 0) * 2 + 1];
+
+// ---------- SOUND FX (synthesized) ----------
+function tone(f0, f1, dur, type, vol, delay = 0) {
+  if (!actx || actx.state !== 'running') return;
+  const t = actx.currentTime + delay, o = actx.createOscillator(), g = actx.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t + dur + 0.02);
+}
+function crackle(dur, vol, hp, delay = 0) {
+  if (!actx || actx.state !== 'running') return;
+  const n = actx.sampleRate * dur | 0, b = actx.createBuffer(1, n, actx.sampleRate), d = b.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const src = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
+  src.buffer = b; f.type = 'highpass'; f.frequency.value = hp; g.gain.value = vol;
+  src.connect(f); f.connect(g); g.connect(actx.destination); src.start(actx.currentTime + delay);
+}
+const screech = () => { tone(2400, 900, .55, 'sawtooth', .16); tone(3100, 1300, .55, 'square', .06, .04); sfxGate = .7; };
+const siren = () => { for (const d of [0, .24]) tone(1000, 980, .14, 'square', .13, d); sfxGate = .6; };
+const crunch = () => { crackle(.1, .5, 1500); crackle(.08, .35, 3200, .07); sfxGate = .25; };
+const clang = () => { tone(1500, 1200, .4, 'triangle', .28); tone(2300, 2000, .3, 'sine', .12); sfxGate = .5; };
+
+// ---------- TRAPS, LASERS, GLASS ----------
+const laserOn = l => Math.floor((clk + l.ph) / 2) % 2 === 0; // toggles every 2s
+function setLure(tx, ty, speed) { monster.lure = { tx, ty, speed, ttl: 8, linger: 1.5 }; }
+
+function placeTraps() {
+  lasers = []; glassAt = {}; bolts = []; ripples = [];
+  const far = (x, y, ax, ay, d) => Math.abs(x - ax) + Math.abs(y - ay) > d;
+  const cand = [];
+  for (let y = 1; y < GH - 1; y++) for (let x = 1; x < GW - 1; x++) {
+    if (grid[y][x]) continue;
+    const h = !grid[y][x - 1] && !grid[y][x + 1] && grid[y - 1][x] && grid[y + 1][x];
+    const v = !grid[y - 1][x] && !grid[y + 1][x] && grid[y][x - 1] && grid[y][x + 1];
+    if ((h || v) && far(x, y, 1, 1, 7) && far(x, y, GW - 2, 1, 5) && far(x, y, GW - 2, GH - 2, 3)) cand.push({ x, y, h });
+  }
+  cand.sort(() => Math.random() - .5);
+  for (const c of cand) if (lasers.length < cfg.lasers && lasers.every(l => far(c.x, c.y, l.x, l.y, 5))) lasers.push({ ...c, ph: Math.random() * 4 });
+  const m = mazeC.getContext('2d');
+  let n = 0, tries = 0;
+  while (n < cfg.glass && tries++ < 400) {
+    const x = 1 + Math.random() * (GW - 2) | 0, y = 1 + Math.random() * (GH - 2) | 0;
+    if (grid[y][x] || glassAt[x + ',' + y] || !far(x, y, 1, 1, 4) || lasers.some(l => l.x === x && l.y === y)) continue;
+    glassAt[x + ',' + y] = true; n++;
+    for (let i = 0; i < 9; i++) {
+      const sx = x * T + 3 + Math.random() * (T - 6), sy = y * T + 3 + Math.random() * (T - 6);
+      m.fillStyle = Math.random() < .5 ? 'rgba(200,235,245,.75)' : 'rgba(120,200,225,.55)';
+      m.beginPath(); m.moveTo(sx, sy); m.lineTo(sx + 2 + Math.random() * 5, sy + Math.random() * 3);
+      m.lineTo(sx + Math.random() * 3, sy + 2 + Math.random() * 5); m.fill();
+    }
+  }
+}
+
+function drawLasers(a) {
+  for (const l of lasers) {
+    const on = laserOn(l), x = l.x * T, y = l.y * T;
+    if (a < 1 && !on) continue;
+    ctx.save(); ctx.globalAlpha = a;
+    ctx.fillStyle = on ? '#ff2a3d' : '#5a1a22';
+    if (l.h) { ctx.fillRect(x + T / 2 - 3, y, 6, 3); ctx.fillRect(x + T / 2 - 3, y + T - 3, 6, 3); }
+    else { ctx.fillRect(x, y + T / 2 - 3, 3, 6); ctx.fillRect(x + T - 3, y + T / 2 - 3, 3, 6); }
+    if (on) {
+      ctx.shadowColor = '#ff2a3d'; ctx.shadowBlur = 12; ctx.strokeStyle = '#ff5566'; ctx.lineWidth = 2;
+      for (let i = 0; i < 3; i++) { // beams sweep across the tile
+        const q = (clk * 16 + i * T / 3) % T;
+        ctx.beginPath();
+        if (l.h) { ctx.moveTo(x + q, y); ctx.lineTo(x + q, y + T); } else { ctx.moveTo(x, y + q); ctx.lineTo(x + T, y + q); }
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+}
+
+// ---------- LOCKERS: DON'T BREATHE ----------
+const hideTh = () => base * 1.5 + 0.008; // any breath or gasp above this rips the door open
+const zap = () => { tone(140, 50, .7, 'sawtooth', .2); crackle(.6, .4, 700); sfxGate = .8; };
+
+function pathLen(sx, sy, tx, ty) {
+  const dist = new Int16Array(GW * GH).fill(-1), q = [sy * GW + sx];
+  dist[q[0]] = 0;
+  for (let i = 0; i < q.length; i++) {
+    const c = q[i], x = c % GW, y = c / GW | 0;
+    if (x === tx && y === ty) return dist[c];
+    for (const [dx, dy] of D) {
+      const nx = x + dx, ny = y + dy;
+      if (grid[ny][nx] || dist[ny * GW + nx] >= 0) continue;
+      dist[ny * GW + nx] = dist[c] + 1; q.push(ny * GW + nx);
+    }
+  }
+  return 0;
+}
+
+function placeLockers() {
+  lockers = []; hide = null;
+  const m = mazeC.getContext('2d'), cand = [];
+  for (let y = 1; y < GH - 1; y++) for (let x = 1; x < GW - 1; x++) {
+    if (grid[y][x] || glassAt[x + ',' + y] || lasers.some(l => l.x === x && l.y === y)) continue;
+    const walls = grid[y - 1][x] + grid[y + 1][x] + grid[y][x - 1] + grid[y][x + 1];
+    if (walls >= 2 && Math.abs(x - 1) + Math.abs(y - 1) > 5 && Math.abs(x - (GW - 2)) + Math.abs(y - 1) > 3) cand.push({ x, y });
+  }
+  cand.sort(() => Math.random() - .5);
+  for (const c of cand) if (lockers.length < cfg.lockers && lockers.every(l => Math.abs(l.x - c.x) + Math.abs(l.y - c.y) > 5))
+    lockers.push({ ...c, cx: (c.x + .5) * T, cy: (c.y + .5) * T });
+  for (const l of lockers) {
+    const x = l.x * T, y = l.y * T;
+    m.fillStyle = '#2b3846'; m.fillRect(x + 4, y + 2, T - 8, T - 4);
+    m.fillStyle = '#6b8196'; m.fillRect(x + 6, y + 4, T - 12, T - 8);
+    m.fillStyle = '#34444f'; for (let i = 0; i < 3; i++) m.fillRect(x + 9, y + 7 + i * 3, T - 18, 1.5);
+    m.fillRect(x + T / 2 - .5, y + 4, 1, T - 8);
+    m.fillStyle = '#c9d6df'; m.fillRect(x + T - 11, y + T / 2 + 2, 2, 6);
+  }
+}
+
+function tryHide() {
+  if (hide) return;
+  const lk = lockers.find(l => Math.hypot(l.cx - player.x, l.cy - player.y) < 40);
+  if (!lk) return;
+  hide = { lk, t: 5, grace: .6, leaving: false, leave: 0 };
+  player.x = lk.cx; player.y = lk.cy; stepN = glassN = 0;
+  const m = monster; m.hunt = 0; m.alert = 0;
+  const steps = pathLen(m.x / T | 0, m.y / T | 0, lk.x, lk.y);
+  // the monster comes straight to the door, arriving within a couple of seconds
+  m.lure = { tx: lk.x, ty: lk.y, speed: Math.min(420, Math.max(110, steps * T / 2.2)), ttl: 20, linger: 99 };
+  tone(160, 90, .18, 'square', .05); sfxGate = .35;
+}
+
+function updHide(dt) {
+  const h = hide;
+  eff = level; stepN = glassN = 0;
+  nstate = eff > breach ? 2 : eff > warn ? 1 : 0;
+  flashT = Math.max(0, flashT - dt); alarmT = Math.max(0, alarmT - dt);
+  updBolts(dt);
+  for (const r of ripples) r.t += dt;
+  ripples = ripples.filter(r => r.t <= .9);
+  monster.hunt = 0; monster.alert = 0;
+  updMonster(dt);
+  if (!h.leaving) {
+    h.t -= dt; h.grace -= dt;
+    if (h.grace <= 0 && level > hideTh()) { // breath or gasp: door ripped open
+      screech(); flashT = 1; loseMsg = 'THE LOCKER WAS RIPPED OPEN'; state = 'lose'; return;
+    }
+    if (h.t <= 0) { // survived: send the monster away
+      h.t = 0; h.leaving = true; h.leave = 0;
+      const m = monster; m.lure = null;
+      let t = rndCell(), n = 0;
+      while (Math.abs(t[0] - h.lk.x) + Math.abs(t[1] - h.lk.y) < 12 && n++ < 40) t = rndCell();
+      m.target = t;
+    }
+  } else {
+    h.leave += dt;
+    if (Math.hypot(monster.x - h.lk.cx, monster.y - h.lk.cy) > T * 3 || h.leave > 4) {
+      hide = null; catchImm = 1.5;
+      const d = h.lk.digit; if (d !== undefined) known[d] = true;
+      toastS = d !== undefined ? 'SCRATCHED INSIDE: DIGIT ' + (d + 1) + ' = ' + code[d] : 'IT WALKED AWAY'; toastT = 3.5;
+    }
+  }
+}
+
+// ---------- DECOY BOLTS ----------
+function throwBolt() {
+  if (boltCD > 0 || hide || keypad) return;
+  boltCD = .9;
+  bolts.push({ x: player.x, y: player.y, vx: player.fx * 380, vy: player.fy * 380, life: .7 });
+  tone(700, 250, .12, 'triangle', .08);
+}
+function updBolts(dt) {
+  boltCD = Math.max(0, boltCD - dt);
+  for (let i = bolts.length - 1; i >= 0; i--) {
+    const b = bolts[i], nx = b.x + b.vx * dt, ny = b.y + b.vy * dt;
+    b.life -= dt;
+    const hit = grid[ny / T | 0][nx / T | 0];
+    if (!hit) { b.x = nx; b.y = ny; }
+    if (hit || b.life <= 0) { // impact: loud clang pulls the monster over
+      bolts.splice(i, 1);
+      ripples.push({ x: b.x, y: b.y, t: 0, c: '160,255,220' });
+      clang(); monster.hunt = 0; setLure(b.x / T | 0, b.y / T | 0, 125);
+    }
+  }
+}
+function drawFx() {
+  drawTerminal(); drawElevator();
+  for (const r of ripples) {
+    const k = r.t / .9;
+    ctx.strokeStyle = `rgba(${r.c},${1 - k})`; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(r.x, r.y, 8 + k * 80, 0, 7); ctx.stroke();
+  }
+  ctx.shadowColor = '#fff'; ctx.shadowBlur = 8; ctx.fillStyle = '#d8e4ee';
+  for (const b of bolts) ctx.fillRect(b.x - 3, b.y - 3, 6, 6);
+  ctx.shadowBlur = 0;
+}
+
+// ---------- GAME SETUP ----------
+// ---------- LEVELS ----------
+// Each sector toggles traps, lighting and objectives through this table.
+const LEVELS = [
+  { name: 'SECTOR A', sub: 'STEALTH', lasers: 0, glass: 0, lockers: 4, m: .9 },
+  { name: 'SECTOR B', sub: 'LASERS & GLASS: USE BOLTS', lasers: 6, glass: 16, lockers: 5, m: 1, guard: true },
+  { name: 'SECTOR C', sub: 'BLACKOUT', lasers: 3, glass: 8, lockers: 7, m: 1.05, dark: true, term: true },
+  { name: 'SECTOR D', sub: 'EXTRACTION', lasers: 5, glass: 6, lockers: 4, m: 1.1 }
+];
+cfg = LEVELS[0];
+const BTN = { x: MW / 2 - 100, y: MH / 2 + 50, w: 200, h: 44 }; // restart button on end screens
+
+function startGame() { cards = 0; loadLevel(1); } // full restart
+
+/** Build a sector: maze, monster, traps, lockers, keycard, terminal, lamps. */
+function loadLevel(n) {
+  lvl = n; cfg = LEVELS[n - 1];
+  genMaze();
+  showMap = false; seen = Array.from({ length: GH }, () => Array(GW).fill(false));
+  player = { x: T * 1.5, y: T * 1.5, fx: 1, fy: 0 };
+  exitPos = { x: (GW - 2 + .5) * T, y: (GH - 2 + .5) * T };
+  monster = { x: (GW - 2 + .5) * T, y: 1.5 * T, target: null, hunt: 0, alert: 0, heard: null, lure: null, stun: 0, stunCD: 0, guard: null };
+  got = 0; time = 0; hint = n === 1 ? 10 : 0; stepN = 0; level = 0; glassN = 0; prevN = 0;
+  flashT = alarmT = 0; alertCD = laserCD = boltCD = 0; catchImm = 1.5; loseMsg = 'It followed the sound.';
+  frenzy = false; elev = { on: false, t: 0 }; keypad = null; term = null; lamps = [];
+  solved = !cfg.term; code = []; known = [false, false, false];
+  placeTraps(); placeLockers();
+  cores = [];
+  if (n < 4) placeCard();
+  if (cfg.term) { // 3-digit code, one digit scratched inside each of three lockers
+    code = [0, 1, 2].map(() => Math.random() * 10 | 0);
+    lockers.slice(0, 3).forEach((l, i) => l.digit = i);
+    for (let i = lockers.length; i < 3; i++) known[i] = true;
+    placeTerminal();
+  }
+  if (cfg.dark) for (let i = 0; i < 7; i++) { const [cx, cy] = rndCell(); lamps.push({ x: (cx + .5) * T, y: (cy + .5) * T, ph: Math.random() * 6 }); }
+  toastS = cfg.name + ': ' + cfg.sub; toastT = 3;
+  state = 'play';
+}
+
+function rndNear(g, d) {
+  for (let i = 0; i < 60; i++) { const c = rndCell(); if (Math.abs(c[0] - g[0]) + Math.abs(c[1] - g[1]) <= d) return c; }
+  return g;
+}
+
+/** Keycard far from the start. In Sector B the monster guards it (throw bolts to pull it away). */
+function placeCard() {
+  let pos = null;
+  for (let i = 0; i < 400 && !pos; i++) {
+    const [cx, cy] = rndCell();
+    if (Math.abs(cx - 1) + Math.abs(cy - 1) > 16 && cx < GW - 2 && !lockers.some(l => l.x === cx && l.y === cy)) pos = [cx, cy];
+  }
+  pos = pos || [GW - 4, GH - 2];
+  cores.push({ cx: pos[0], cy: pos[1], x: (pos[0] + .5) * T, y: (pos[1] + .5) * T, taken: false });
+  if (cfg.guard) { monster.x = (pos[0] + .5) * T; monster.y = (pos[1] + .5) * T; monster.guard = pos; }
+}
+
+function placeTerminal() {
+  for (let i = 0; i < 400; i++) {
+    const [cx, cy] = rndCell();
+    if (Math.abs(cx - 1) + Math.abs(cy - 1) > 10 && !(cx === GW - 2 && cy === GH - 2) &&
+        !lockers.some(l => l.x === cx && l.y === cy) && !cores.some(c => c.cx === cx && c.cy === cy)) {
+      term = { x: cx, y: cy, cx: (cx + .5) * T, cy: (cy + .5) * T }; return;
+    }
+  }
+  term = { x: 15, y: 11, cx: 15.5 * T, cy: 11.5 * T };
+}
+
+// ---------- OBJECTIVES, TERMINAL, ELEVATOR ----------
+const exitOpen = () => lvl === 4 ? elev.t >= 15 : got > 0 && solved;
+function advance() { if (lvl === 4) state = 'win'; else loadLevel(lvl + 1); }
+
+function objective() {
+  if (lvl === 4) return !elev.on ? 'CALL THE ELEVATOR AT THE EXIT [E]' : elev.t < 15 ? 'SURVIVE ' + (15 - elev.t).toFixed(1) + 's' : 'ELEVATOR OPEN: GO!';
+  const c = cfg.term && !solved ? '   CODE ' + code.map((d, i) => known[i] ? d : '?').join(' ') : '';
+  if (!got) return 'FIND THE KEYCARD' + c;
+  if (!solved) return 'HIDE IN LOCKERS FOR DIGITS, THEN USE TERMINAL [E]' + c;
+  return 'REACH THE EXIT';
+}
+
+/** E key: terminal keypad, elevator call, or locker (in that order). */
+function interact() {
+  if (hide) return;
+  if (term && !solved && Math.hypot(term.cx - player.x, term.cy - player.y) < 40) { keypad = { buf: '', msg: '' }; return; }
+  if (lvl === 4 && !elev.on && Math.hypot(exitPos.x - player.x, exitPos.y - player.y) < 40) {
+    elev.on = true; frenzy = true; flashT = 1; screech(); toastS = 'ELEVATOR ENGAGED: IT KNOWS'; toastT = 3; return;
+  }
+  tryHide();
+}
+
+function keypadKey(e) {
+  if (e.repeat) return;
+  if (/^[0-9]$/.test(e.key) && keypad.buf.length < 3) keypad.buf += e.key;
+  else if (e.code === 'Backspace') keypad.buf = keypad.buf.slice(0, -1);
+  else if (e.code === 'Escape' || e.code === 'KeyE') keypad = null;
+  else if (e.code === 'Enter' && keypad.buf.length === 3) {
+    if (keypad.buf === code.join('')) { solved = true; keypad = null; toastS = 'ACCESS GRANTED: EXIT UNLOCKED'; toastT = 3; }
+    else { keypad.buf = ''; keypad.msg = 'WRONG CODE: ALARM!'; siren(); flashT = 1; alarmT = 1.5; setLure(term.x, term.y, 130); }
+  }
+}
+
+/** Elevator door: 15s mechanical opening with periodic clanks. */
+function updElev(dt) {
+  if (!elev.on || elev.t >= 15) return;
+  elev.t = Math.min(15, elev.t + dt);
+  elev.clank = (elev.clank || 0) - dt;
+  if (elev.clank <= 0) { elev.clank = 2; tone(90, 60, .35, 'square', .1); sfxGate = .4; }
+  if (elev.t >= 15) { toastS = 'ELEVATOR OPEN'; toastT = 2.5; }
+}
+
+function drawTerminal() {
+  if (!term) return;
+  const c = solved ? '#25ff7a' : '#ffd23a';
+  ctx.save(); ctx.globalAlpha = solved ? .35 : .85; ctx.shadowColor = c; ctx.shadowBlur = 12;
+  ctx.fillStyle = c; ctx.fillRect(term.cx - 7, term.cy - 6, 14, 12);
+  ctx.fillStyle = '#000'; ctx.fillRect(term.cx - 5, term.cy - 4, 10, 4);
+  ctx.restore();
+}
+function drawElevator() {
+  if (lvl !== 4) return;
+  const p = Math.min(1, elev.t / 15), x = exitPos.x, y = exitPos.y, w = 11 * (1 - p);
+  ctx.save(); ctx.shadowColor = p >= 1 ? '#25ff7a' : '#ffd23a'; ctx.shadowBlur = 12;
+  ctx.fillStyle = p >= 1 ? '#25ff7a' : '#10151a'; ctx.fillRect(x - 11, y - 12, 22, 24);
+  ctx.fillStyle = '#9aa8b4'; ctx.fillRect(x - 11, y - 12, w, 24); ctx.fillRect(x + 11 - w, y - 12, w, 24);
+  ctx.restore();
+}
+/** Sector C: red emergency tint plus flickering lamps over the blackout. */
+function drawEmergency() {
+  ctx.fillStyle = 'rgba(110,0,12,.12)'; ctx.fillRect(0, 0, MW, MH);
+  for (const l of lamps) {
+    const a = .25 + Math.sin(clk * 5 + l.ph) * .1, g = ctx.createRadialGradient(l.x, l.y, 2, l.x, l.y, 70);
+    g.addColorStop(0, `rgba(255,30,40,${a})`); g.addColorStop(1, 'rgba(255,30,40,0)');
+    ctx.fillStyle = g; ctx.fillRect(l.x - 70, l.y - 70, 140, 140);
+  }
+}
+
+// ---------- BLUEPRINT MAP ----------
+/** Mark tiles near the player as discovered (smaller radius in the blackout). */
+function reveal() {
+  const r = cfg.dark ? 2.3 : 4.5, px = player.x / T, py = player.y / T;
+  for (let y = Math.max(0, (py - r) | 0); y <= Math.min(GH - 1, (py + r) | 0); y++)
+    for (let x = Math.max(0, (px - r) | 0); x <= Math.min(GW - 1, (px + r) | 0); x++)
+      if (Math.hypot(x + .5 - px, y + .5 - py) <= r) seen[y][x] = true;
+}
+
+/** Semi-transparent blueprint (M). Drawn over the live game, which keeps running. The monster is never shown. */
+function drawMap() {
+  ctx.fillStyle = 'rgba(4,24,60,.74)'; ctx.fillRect(0, 0, MW, MH);
+  for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) {
+    if (!seen[y][x]) continue;
+    ctx.fillStyle = grid[y][x] ? 'rgba(90,180,255,.5)' : 'rgba(30,80,150,.28)';
+    ctx.fillRect(x * T, y * T, T, T);
+    ctx.strokeStyle = 'rgba(140,210,255,.35)'; ctx.lineWidth = 1; ctx.strokeRect(x * T + .5, y * T + .5, T - 1, T - 1);
+  }
+  const mark = (x, y, col, txt) => { // only shown once its tile has been discovered
+    if (!seen[y][x]) return;
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.strokeRect(x * T + 3, y * T + 3, T - 6, T - 6);
+    glowText(txt, (x + .5) * T, (y + .5) * T + 4, 11, col);
+  };
+  for (const l of lasers) mark(l.x, l.y, '#ff5566', 'LZ');
+  for (const l of lockers) mark(l.x, l.y, '#ffd23a', 'L');
+  for (const c of cores) if (!c.taken) mark(c.cx, c.cy, '#3ad8ff', 'K');
+  if (term && !solved) mark(term.x, term.y, '#ffd23a', 'T');
+  mark(GW - 2, GH - 2, '#25ff7a', lvl === 4 ? 'EL' : 'EX');
+  ctx.globalAlpha = .6 + .4 * Math.sin(clk * 6); ctx.fillStyle = '#25ff7a';
+  ctx.fillRect(player.x - 5, player.y - 5, 10, 10); ctx.globalAlpha = 1;
+  glowText('FACILITY BLUEPRINT   [M] CLOSE', MW / 2, 22, 14, '#9fdcff');
+  glowText('LZ laser zone   L locker   K keycard   T terminal   EX exit', MW / 2, MH - 10, 11, '#9fdcff');
+}
+
+// Click the RESTART / PLAY AGAIN button on the end screens
+cv.addEventListener('pointerdown', e => {
+  if (state !== 'win' && state !== 'lose') return;
+  const r = cv.getBoundingClientRect(), x = (e.clientX - r.left) * cv.width / r.width, y = (e.clientY - r.top) * cv.height / r.height;
+  if (x > BTN.x && x < BTN.x + BTN.w && y > BTN.y && y < BTN.y + BTN.h) startGame();
+});
+
+// ---------- UPDATE ----------
+function blocked(x, y, r) {
+  for (const [ox, oy] of [[-r,-r],[r,-r],[-r,r],[r,r]])
+    if (grid[(y + oy) / T | 0][(x + ox) / T | 0]) return true;
+  return false;
+}
+function movePlayer(dx, dy) {
+  if (!blocked(player.x + dx, player.y, 8)) player.x += dx;
+  if (!blocked(player.x, player.y + dy, 8)) player.y += dy;
+}
+
+function updMonster(dt) {
+  const m = monster, pt = [player.x / T | 0, player.y / T | 0], mt = [m.x / T | 0, m.y / T | 0];
+  m.hunt = Math.max(0, m.hunt - dt); m.alert = Math.max(0, m.alert - dt); m.stunCD = Math.max(0, m.stunCD - dt);
+  if (m.stun > 0) { m.stun -= dt; if (m.stun <= 0) m.stunCD = 3; return; } // frozen by laser
+  if (nstate >= 1 && !hide) { m.heard = pt; m.alert = 2.5; }
+  if (nstate === 2 && !hide) m.hunt = 3.5;
+  // a chasing monster that walks through a live laser is stunned for 3s
+  if ((m.hunt > 0 || m.alert > 0 || m.lure || frenzy) && m.stunCD <= 0 && lasers.some(l => l.x === mt[0] && l.y === mt[1] && laserOn(l))) {
+    m.stun = 3; zap(); alarmT = 1.5;
+    ripples.push({ x: m.x, y: m.y, t: 0, c: '120,220,255' });
+    return;
+  }
+  if (m.lure) {
+    m.lure.ttl -= dt;
+    if (mt[0] === m.lure.tx && mt[1] === m.lure.ty) m.lure.linger -= dt;
+    if (m.lure.ttl <= 0 || m.lure.linger <= 0) m.lure = null;
+  }
+  let speed = 44 * cfg.m, tgt = m.target;
+  if (m.hunt > 0) { speed = 125; tgt = pt; }                                   // sprint at the player
+  else if (m.lure) { speed = m.lure.speed; tgt = [m.lure.tx, m.lure.ty]; }    // alarm or bolt
+  else if (m.alert > 0) { speed = 78; tgt = m.heard; }
+  else if (!tgt || (tgt[0] === mt[0] && tgt[1] === mt[1])) tgt = m.guard ? rndNear(m.guard, 6) : rndCell();
+  if (frenzy && !hide) { speed = 100; tgt = pt; } // Sector D: relentless sprint
+  m.target = tgt;
+  const nx = bfs(mt[0], mt[1], tgt[0], tgt[1]);
+  if (!nx) { m.target = null; return; }
+  const cx = (nx[0] + .5) * T, cy = (nx[1] + .5) * T, d = Math.hypot(cx - m.x, cy - m.y);
+  if (d > 1) { const s = Math.min(d, speed * dt); m.x += (cx - m.x) / d * s; m.y += (cy - m.y) / d * s; }
+}
+
+function update(dt) {
+  clk += dt; sfxGate = Math.max(0, sfxGate - dt);
+  toastT = Math.max(0, toastT - dt); catchImm = Math.max(0, catchImm - dt);
+  if (state === 'play') updElev(dt);
+  const raw = readMic();
+  if (state === 'calib') {
+    if (micOK && actx.state !== 'running') return;
+    calibT += dt; calibSum += raw; calibN++;
+    eff = level;
+    nstate = eff > breach ? 2 : eff > warn ? 1 : 0;
+    if (calibT >= 3) {
+      base = micOK ? calibSum / calibN : 0.004;
+      warn = base * 2 + 0.012; breach = base * 3.5 + 0.03;
+      startGame();
+    }
+    return;
+  }
+  if (state !== 'play') return;
+  time += dt; hint = Math.max(0, hint - dt);
+  reveal();
+  if (hide) { updHide(dt); return; }
+  const dx = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0), dy = (keys.KeyS ? 1 : 0) - (keys.KeyW ? 1 : 0);
+  const mv = keypad ? 0 : (dx || dy), slow = keys.ShiftLeft || keys.ShiftRight;
+  if (mv) {
+    const l = Math.hypot(dx, dy), sp = (slow ? 50 : 105) * dt;
+    movePlayer(dx / l * sp, dy / l * sp); player.fx = dx / l; player.fy = dy / l;
+  }
+  const pt = [player.x / T | 0, player.y / T | 0];
+  // footsteps and glass add noise unless sneaking
+  stepN += ((mv && !slow ? (warn - base) * 0.7 : 0) - stepN) * Math.min(1, dt * 8);
+  glassN *= Math.max(0, 1 - dt * 3); glassTimer -= dt;
+  if (mv && !slow && glassAt[pt[0] + ',' + pt[1]] && glassTimer <= 0) { crunch(); glassTimer = .3; glassN = (warn - base) * 1.3; }
+  eff = level + stepN + glassN;
+  nstate = eff > breach ? 2 : eff > warn ? 1 : 0;
+  alertCD -= dt; laserCD -= dt; flashT = Math.max(0, flashT - dt); alarmT = Math.max(0, alarmT - dt);
+  if (nstate === 2 && prevN < 2 && alertCD <= 0) { // volume spike: screech + meter flash
+    screech(); flashT = 1; alertCD = 1.5;
+    ripples.push({ x: player.x, y: player.y, t: 0, c: '255,60,70' });
+  }
+  prevN = nstate;
+  for (const l of lasers) if (l.x === pt[0] && l.y === pt[1] && laserOn(l) && laserCD <= 0) {
+    siren(); laserCD = 3; flashT = 1; alarmT = 1.5; setLure(l.x, l.y, 130);
+    ripples.push({ x: (l.x + .5) * T, y: (l.y + .5) * T, t: 0, c: '255,60,70' });
+  }
+  updBolts(dt);
+  for (let i = ripples.length - 1; i >= 0; i--) if ((ripples[i].t += dt) > .9) ripples.splice(i, 1);
+  updMonster(dt);
+  for (const c of cores) if (!c.taken && Math.hypot(c.x - player.x, c.y - player.y) < 16) { c.taken = true; got++; cards++; toastS = 'KEYCARD ' + cards + ' ACQUIRED'; toastT = 2.5; }
+  if (exitOpen() && Math.hypot(exitPos.x - player.x, exitPos.y - player.y) < 16) advance();
+  if (catchImm <= 0 && monster.stun <= 0 && Math.hypot(monster.x - player.x, monster.y - player.y) < 16) state = 'lose';
+}
+
+// ---------- DRAW ----------
+function glowText(t, x, y, size, color, align = 'center') {
+  ctx.font = `${size}px ${FONT}`; ctx.textAlign = align;
+  ctx.shadowColor = color; ctx.shadowBlur = 14; ctx.fillStyle = color;
+  ctx.fillText(t, x, y); ctx.shadowBlur = 0;
+}
+
+function drawMeter() {
+  const y0 = MH, x0 = 30, w = MW - 60, bh = 18, by = y0 + 34;
+  const flash = flashT > 0 && Math.floor(clk * 12) % 2 === 0;
+  ctx.fillStyle = flash ? '#3a0509' : '#05080b'; ctx.fillRect(0, y0, MW, BAR);
+  ctx.fillStyle = '#12301f'; ctx.fillRect(0, y0, MW, 1);
+  const col = flash || nstate === 2 ? '#ff2a3d' : nstate === 1 ? '#ffd23a' : '#25ff7a';
+  const label = flash || nstate === 2 ? 'BREACH' : nstate === 1 ? 'WARNING' : 'SILENT';
+  const db = Math.round(20 * Math.log10(Math.max(eff, 1e-5)));
+  glowText('AUDIO LEVEL  ' + db + ' dBFS', x0, y0 + 24, 14, '#7fa592', 'left');
+  glowText(label, x0 + w, y0 + 24, 14, col, 'right');
+  if (state === 'play') glowText('[M] MAP', MW / 2, y0 + 24, 14, showMap ? '#3ad8ff' : '#7fa592');
+  ctx.fillStyle = '#0d1a14'; ctx.fillRect(x0, by, w, bh);
+  const max = breach * 1.6, f = Math.min(1, eff / max);
+  ctx.shadowColor = col; ctx.shadowBlur = 20; ctx.fillStyle = col;
+  ctx.fillRect(x0, by, w * f, bh); ctx.shadowBlur = 0;
+  ctx.fillStyle = '#ffffff88';
+  for (const th of [warn, breach]) ctx.fillRect(x0 + w * Math.min(1, th / max) - 1, by - 4, 2, bh + 8);
+}
+
+function drawWorld() {
+  ctx.drawImage(mazeC, 0, 0);
+  drawLasers(1);
+  const m = monster;
+  // monster
+  ctx.save(); ctx.translate(m.x, m.y);
+  const hunting = m.hunt > 0;
+  ctx.shadowColor = '#ff1030'; ctx.shadowBlur = hunting ? 26 : 12;
+  ctx.fillStyle = m.stun > 0 ? '#9fe0ff' : hunting ? '#ff2a3d' : '#d41a2c';
+  ctx.beginPath(); ctx.arc(0, 0, 11, 0, 7); ctx.fill();
+  if (m.stun > 0) {
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.beginPath();
+    for (let i = 0; i < 6; i++) ctx.lineTo((Math.random() - .5) * 30, (Math.random() - .5) * 30);
+    ctx.stroke();
+  }
+  ctx.restore();
+  // fog of war
+  const flick = Math.sin(time * 23) * 2 + Math.sin(time * 7.3) * 3;
+  const r = cfg.dark ? 34 + flick * .5 : Math.max(70, 135 - nstate * 22 + flick);
+  fx.globalCompositeOperation = 'source-over';
+  fx.clearRect(0, 0, MW, MH);
+  fx.fillStyle = cfg.dark ? 'rgba(0,0,0,.99)' : 'rgba(0,0,0,.965)'; fx.fillRect(0, 0, MW, MH);
+  fx.globalCompositeOperation = 'destination-out';
+  const g = fx.createRadialGradient(player.x, player.y, 6, player.x, player.y, r);
+  g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(.55, 'rgba(0,0,0,.85)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  fx.fillStyle = g; fx.fillRect(0, 0, MW, MH);
+  for (const l of lamps) { // emergency lamps punch flickering holes in the blackout
+    const f = .55 + Math.sin(clk * 5 + l.ph) * .2 - (Math.random() < .03 ? .3 : 0);
+    const gg = fx.createRadialGradient(l.x, l.y, 2, l.x, l.y, 64);
+    gg.addColorStop(0, `rgba(0,0,0,${f})`); gg.addColorStop(1, 'rgba(0,0,0,0)');
+    fx.fillStyle = gg; fx.fillRect(l.x - 64, l.y - 64, 128, 128);
+  }
+  ctx.drawImage(fogC, 0, 0);
+  drawLasers(.3); drawFx();
+  if (cfg.dark) drawEmergency();
+  // faint beacons through the fog
+  const pulse = .35 + Math.sin(time * 3) * .15;
+  ctx.save(); ctx.globalAlpha = pulse;
+  for (const c of cores) if (!c.taken) {
+    ctx.shadowColor = '#3ad8ff'; ctx.shadowBlur = 16; ctx.fillStyle = '#3ad8ff';
+    ctx.fillRect(c.x - 7, c.y - 5, 14, 10); // keycard
+  }
+  const open = exitOpen();
+  ctx.globalAlpha = open ? .9 : .3; ctx.shadowColor = open ? '#25ff7a' : '#ff2a3d';
+  ctx.shadowBlur = 16; ctx.strokeStyle = ctx.shadowColor; ctx.lineWidth = 3;
+  ctx.strokeRect(exitPos.x - 10, exitPos.y - 10, 20, 20);
+  ctx.restore();
+  // player
+  if (!hide) {
+    ctx.shadowColor = '#25ff7a'; ctx.shadowBlur = 14; ctx.fillStyle = '#25ff7a';
+    ctx.fillRect(player.x - 8, player.y - 8, 16, 16); ctx.shadowBlur = 0;
+    for (const l of lockers) if (Math.hypot(l.cx - player.x, l.cy - player.y) < 40) glowText('[E] HIDE', l.cx, l.cy - 18, 12, '#9fb8c8');
+  }
+  // danger vignette
+  const dist = Math.hypot(monster.x - player.x, monster.y - player.y) / T;
+  if (dist < 9 || hunting) {
+    const a = (hunting ? .35 : (1 - dist / 9) * .3) * (.6 + .4 * Math.abs(Math.sin(time * (hunting ? 9 : 4))));
+    const v = ctx.createRadialGradient(MW / 2, MH / 2, MH * .35, MW / 2, MH / 2, MW * .6);
+    v.addColorStop(0, 'rgba(255,0,30,0)'); v.addColorStop(1, `rgba(255,0,30,${a})`);
+    ctx.fillStyle = v; ctx.fillRect(0, 0, MW, MH);
+  }
+  if (hide) { // inside the locker
+    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(0, 0, MW, MH);
+    glowText(hide.leaving ? "...IT'S LEAVING" : "DON'T BREATHE", MW / 2, MH / 2 - 14, 34, hide.leaving ? '#ffd23a' : '#ff2a3d');
+    ctx.fillStyle = '#2a0a0e'; ctx.fillRect(MW / 2 - 150, MH / 2 + 4, 300, 8);
+    ctx.fillStyle = '#ff2a3d'; ctx.fillRect(MW / 2 - 150, MH / 2 + 4, 300 * Math.max(0, hide.t / 5), 8);
+    glowText(hide.t.toFixed(1) + 's', MW / 2, MH / 2 + 34, 15, '#9fb8c8');
+    if (!hide.leaving && Math.hypot(monster.x - player.x, monster.y - player.y) < T * 2.2 && Math.floor(clk * 3) % 2 === 0)
+      glowText('...sniff...', MW / 2, MH / 2 + 62, 16, '#ff6a78');
+  }
+  if (keypad) { // terminal keypad overlay
+    const px = MW / 2 - 170, py = MH / 2 - 90;
+    ctx.fillStyle = 'rgba(0,0,0,.8)'; ctx.fillRect(px, py, 340, 180);
+    ctx.strokeStyle = '#ffd23a'; ctx.lineWidth = 2; ctx.strokeRect(px, py, 340, 180);
+    glowText('SECURITY TERMINAL', MW / 2, py + 28, 16, '#ffd23a');
+    glowText([0, 1, 2].map(i => keypad.buf[i] || '_').join(' '), MW / 2, py + 76, 40, '#25ff7a');
+    glowText('CLUES ' + code.map((d, i) => known[i] ? d : '?').join(' '), MW / 2, py + 108, 14, '#9fb8c8');
+    if (keypad.msg) glowText(keypad.msg, MW / 2, py + 132, 14, '#ff2a3d');
+    glowText('Type 3 digits. Enter = submit. E = close.', MW / 2, py + 160, 12, '#7fa592');
+  }
+  // HUD
+  glowText(cfg.name + '   KEYCARDS ' + cards + '/3', 12, 20, 14, '#3ad8ff', 'left');
+  glowText(objective(), 12, 40, 12, '#9fb8c8', 'left');
+  glowText(boltCD > 0 ? 'BOLT RELOADING' : 'BOLT READY [SPACE]', MW - 12, 20, 14, '#9fb8c8', 'right');
+  if (alarmT > 0 && Math.floor(clk * 8) % 2 === 0) glowText('INTRUSION ALARM', MW / 2, 44, 18, '#ff2a3d');
+  if (monster.stun > 0) glowText('MONSTER STUNNED ' + monster.stun.toFixed(1) + 's: RUN', MW / 2, 66, 16, '#78d8ff');
+  if (toastT > 0) glowText(toastS, MW / 2, MH / 2, 24, '#25ff7a');
+  if (hint > 0) {
+    ctx.globalAlpha = Math.min(1, hint / 2);
+    glowText('WASD move. Shift sneak. Space bolt. E hide in a locker, then stay silent.', MW / 2, MH - 12, 13, '#7fa592');
+    ctx.globalAlpha = 1;
+  }
+}
+
+function overlay(title, sub, col) {
+  ctx.fillStyle = 'rgba(0,0,0,.94)'; ctx.fillRect(0, 0, MW, MH);
+  glowText(title, MW / 2, MH / 2 - 14, 30, col);
+  glowText(sub, MW / 2, MH / 2 + 22, 15, '#7fa592');
+  ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.shadowColor = col; ctx.shadowBlur = 12;
+  ctx.strokeRect(BTN.x, BTN.y, BTN.w, BTN.h); ctx.shadowBlur = 0;
+  glowText(state === 'win' ? 'PLAY AGAIN' : 'RESTART', MW / 2, BTN.y + 28, 18, col);
+}
+
+function draw() {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height);
+  if (state === 'boot' || state === 'calib') {
+    const cy = MH / 2;
+    glowText('[SYSTEM ONLINE: DO NOT SPEAK. CALIBRATING...]', MW / 2, cy - 20, 20, '#25ff7a');
+    if (state === 'boot') glowText('AWAITING MICROPHONE ACCESS', MW / 2, cy + 20, 14, '#7fa592');
+    else if (micOK && actx.state !== 'running') glowText('CLICK OR PRESS ANY KEY TO ENABLE AUDIO', MW / 2, cy + 20, 14, '#ffd23a');
+    else {
+      const p = Math.min(1, calibT / 3);
+      ctx.fillStyle = '#0d1a14'; ctx.fillRect(MW / 2 - 150, cy + 8, 300, 6);
+      ctx.fillStyle = '#25ff7a'; ctx.fillRect(MW / 2 - 150, cy + 8, 300 * p, 6);
+      glowText('MEASURING AMBIENT NOISE ' + Math.ceil(3 - calibT) + 's', MW / 2, cy + 40, 14, '#7fa592');
+      if (!micOK) glowText('MIC UNAVAILABLE: HOLD N TO SIMULATE NOISE', MW / 2, cy + 70, 13, '#ffd23a');
+    }
+    drawMeter(); return;
+  }
+  drawWorld();
+  if (showMap && state === 'play') drawMap();
+  if (state === 'win') overlay('EXTRACTION SUCCESSFUL - YOU SURVIVED', 'All four sectors cleared. Nobody heard a thing.', '#25ff7a');
+  if (state === 'lose') overlay('GAME OVER - YOU WERE HEARD', loseMsg, '#ff2a3d');
+  drawMeter();
+}
+
+// ---------- LOOP ----------
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt); draw(); requestAnimationFrame(loop);
+}
+initAudio();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
